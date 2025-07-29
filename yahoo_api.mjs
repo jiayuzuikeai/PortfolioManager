@@ -5,6 +5,8 @@ import yahooFinance from 'yahoo-finance2';
 const app = express();
 const port = process.env.PORT || 3000;
 
+import axios from 'axios';
+
 /* ------------------------------------------------------------------ */
 /* 1. 股票搜索  GET /api/search?q=KEYWORD                              */
 /* ------------------------------------------------------------------ */
@@ -25,6 +27,54 @@ app.get('/api/search', async (req, res) => {
 /*    GET /api/top/gainer                                             */
 // /*    GET /api/top/loser                                              */
 // /* ------------------------------------------------------------------ */
+
+app.get('/api/top/gainer', async (_req, res) => {
+  // const options = {
+  //   count: 5,
+  //   region: 'US',
+  //   lang: 'en-US',
+  //   validateResult: false // Disable validation to avoid errors
+  // };
+
+  // // try {
+  // //   const result = await yahooFinance.dailyGainers(options); // Fetching top gainers
+  // //   res.json(result); // Return the top gainers
+  // // } catch (e) {
+  // //   res.status(500).json({ error: e.message });
+  // // }
+
+  // try {
+  //   const result = await yahooFinance._moduleExec({
+  //     moduleName: 'getScreenerGainers',
+  //     query: options,
+  //     resultField: 'finance.result[0].quotes',
+  //     transform: (data) => data,
+  //     validateResult: false
+  //   });
+
+  //   res.json(result);
+  // } catch (e) {
+  //   res.status(500).json({ error: e.message });
+  // }
+
+  const url = 'https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved';
+  const params = {
+    count: 5,
+    start: 0,
+    scrIds: 'day_gainers',
+    lang: 'en-US',
+    region: 'US'
+  };
+
+  try {
+    const response = await axios.get(url, { params });
+    const quotes = response.data.finance.result[0].quotes;
+    res.json(quotes);
+  } catch (error) {
+    console.error('Yahoo API failed:', error.message);
+    res.status(500).json({ error: 'Failed to fetch top gainers' });
+  }
+});
 
 /* ------------------------------------------------------------------ */
 /* 3. 热门交易股票  GET /api/top/trending                              */
