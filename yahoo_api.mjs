@@ -20,7 +20,27 @@ app.get('/api/search', async (req, res) => {
     if (!q) return res.status(400).json({ error: 'Missing query param "q"' });
 
     const result = await yahooFinance.search(q);
-    res.json(result);          // 结构见官方文档
+    const symbols = result.quotes
+      .filter(q => q.quoteType === 'EQUITY')
+      .map(q => q.symbol);
+
+    if (!symbols.length) return res.json([]);
+
+    /* 3. 批量拉行情 */
+    const quotes = await yahooFinance.quote(symbols);
+
+    /* 4. 映射成前端要的格式 */
+    const data = quotes.map(item => ({
+      symbol: item.symbol,
+      name:   item.shortName || item.longName,
+      price:  item.regularMarketPrice,
+      change: item.regularMarketChange,
+      changePercent: item.regularMarketChangePercent,
+      volume: item.regularMarketVolume,
+      marketCap: item.marketCap
+    }));
+
+    res.json(data);          // 结构见官方文档
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -33,37 +53,10 @@ app.get('/api/search', async (req, res) => {
 // /* ------------------------------------------------------------------ */
 
 app.get('/api/top/gainer', async (_req, res) => {
-  // const options = {
-  //   count: 5,
-  //   region: 'US',
-  //   lang: 'en-US',
-  //   validateResult: false // Disable validation to avoid errors
-  // };
-
-  // // try {
-  // //   const result = await yahooFinance.dailyGainers(options); // Fetching top gainers
-  // //   res.json(result); // Return the top gainers
-  // // } catch (e) {
-  // //   res.status(500).json({ error: e.message });
-  // // }
-
-  // try {
-  //   const result = await yahooFinance._moduleExec({
-  //     moduleName: 'getScreenerGainers',
-  //     query: options,
-  //     resultField: 'finance.result[0].quotes',
-  //     transform: (data) => data,
-  //     validateResult: false
-  //   });
-
-  //   res.json(result);
-  // } catch (e) {
-  //   res.status(500).json({ error: e.message });
-  // }
 
   const url = 'https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved';
   const params = {
-    count: 5,
+    count: 10,
     start: 0,
     scrIds: 'day_gainers',
     lang: 'en-US',
@@ -72,8 +65,53 @@ app.get('/api/top/gainer', async (_req, res) => {
 
   try {
     const response = await axios.get(url, { params });
-    const quotes = response.data.finance.result[0].quotes;
-    res.json(quotes);
+    const raw = response.data.finance.result[0].quotes;
+    const list = Array.isArray(raw) ? raw : [raw];
+
+    const data = list.map(item => ({
+      symbol: item.symbol,
+      name:   item.shortName || item.longName,
+      price:  item.regularMarketPrice,
+      change: item.regularMarketChange,
+      changePercent: item.regularMarketChangePercent,
+      volume: item.regularMarketVolume,
+      marketCap: item.marketCap
+    }));
+
+    res.json(data);
+  } catch (error) {
+    console.error('Yahoo API failed:', error.message);
+    res.status(500).json({ error: 'Failed to fetch top gainers' });
+  }
+});
+
+app.get('/api/top/loser', async (_req, res) => {
+
+  const url = 'https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved';
+  const params = {
+    count: 10,
+    start: 0,
+    scrIds: 'day_losers',
+    lang: 'en-US',
+    region: 'US'
+  };
+
+  try {
+    const response = await axios.get(url, { params });
+    const raw = response.data.finance.result[0].quotes;
+    const list = Array.isArray(raw) ? raw : [raw];
+
+    const data = list.map(item => ({
+      symbol: item.symbol,
+      name:   item.shortName || item.longName,
+      price:  item.regularMarketPrice,
+      change: item.regularMarketChange,
+      changePercent: item.regularMarketChangePercent,
+      volume: item.regularMarketVolume,
+      marketCap: item.marketCap
+    }));
+
+    res.json(data);
   } catch (error) {
     console.error('Yahoo API failed:', error.message);
     res.status(500).json({ error: 'Failed to fetch top gainers' });
@@ -85,20 +123,65 @@ app.get('/api/top/gainer', async (_req, res) => {
 /* ------------------------------------------------------------------ */
 app.get('/api/top/trending', async (_req, res) => {
   try {
-    const result = await yahooFinance.trendingSymbols('US'); // 也可换成 'GB' 等
-    res.json(result);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+    /* 1️⃣ 拉取热门榜 symbol */
+    // console.log('Trending symbols0');  // 调试输出
+    const { data: trend } = await axios.get(
+      'https://query1.finance.yahoo.com/v1/finance/trending/US',
+      { params: { count: 10, lang: 'en-US', region: 'US' } }
+    );
+
+    const symbols = (trend?.finance?.result?.[0]?.quotes ?? [])
+      .map(q => q.symbol)
+      // .join(',');
+    console.log('Trending symbols:', symbols);  // 调试输出
+
+    if (!symbols) {
+      return res.status(404).json({ error: 'No trending symbols found' });
+    }
+
+
+    const raw = await yahooFinance.quote(symbols);
+
+    // yahooFinance.quote 可能返回数组或对象，统一成数组
+    const list = Array.isArray(raw) ? raw : [raw];
+
+    const data = list.map(item => ({
+      symbol: item.symbol,
+      name:   item.shortName || item.longName,
+      price:  item.regularMarketPrice,
+      change: item.regularMarketChange,
+      changePercent: item.regularMarketChangePercent,
+      volume: item.regularMarketVolume,
+      marketCap: item.marketCap
+    }));
+
+    res.json(data);
+  } catch (err) {
+    console.error('Trending API failed:', err.message);
+    res.status(500).json({ error: 'Failed to fetch trending stocks' });
   }
 });
 
 /* ------------------------------------------------------------------ */
 /* 4. 市场主要指数  GET /api/index                                     */
 /* ------------------------------------------------------------------ */
-const INDEX_TICKERS = ['^GSPC', '^DJI', '^IXIC', '^RUT', '^TNX']; // 可增删
+const INDEX_TICKERS = ['^GSPC', '^DJI', '^IXIC', '^RUT', '^TNX'];
+
 app.get('/api/index', async (_req, res) => {
   try {
-    const data = await yahooFinance.quote(INDEX_TICKERS);
+    const raw = await yahooFinance.quote(INDEX_TICKERS);
+
+    // yahooFinance.quote 可能返回数组或对象，统一成数组
+    const list = Array.isArray(raw) ? raw : [raw];
+
+    const data = list.map(item => ({
+      symbol: item.symbol,
+      name:   item.shortName || item.longName,
+      price:  item.regularMarketPrice,
+      change: item.regularMarketChange,
+      changePercent: item.regularMarketChangePercent
+    }));
+
     res.json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -112,7 +195,16 @@ app.get('/api/quote/:ticker', async (req, res) => {
   try {
     const { ticker } = req.params;
     const result = await yahooFinance.quote(ticker);
-    res.json(result);
+    const data = {
+      symbol: result.symbol,
+      name: result.shortName || result.longName,
+      price: result.regularMarketPrice,
+      change: result.regularMarketChange,
+      changePercent: result.regularMarketChangePercent,
+      volume: result.regularMarketVolume,
+      marketCap: result.marketCap
+    };
+    res.json(data);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -159,7 +251,6 @@ app.get('/api/history/:ticker', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-
 /* ------------------------------------------------------------------ */
 /* 7. 当前持仓查询  GET /api/portfolio                                 */
 /* ------------------------------------------------------------------ */
