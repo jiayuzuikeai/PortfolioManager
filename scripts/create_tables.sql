@@ -4,7 +4,14 @@ CREATE TABLE IF NOT EXISTS portfolio (
     quantity INT NOT NULL,
     avg_buy_price DECIMAL(10, 2) NOT NULL,
     current_price DECIMAL(10, 2) DEFAULT 0.00,
-    stock_return DECIMAL(10, 2) GENERATED ALWAYS AS ((current_price - avg_buy_price) * quantity) STORED
+    stock_return DECIMAL(10, 2) GENERATED ALWAYS AS ((current_price - avg_buy_price) * quantity) STORED,
+    stock_return_rate DECIMAL(10, 2) GENERATED ALWAYS AS (
+        CASE 
+            WHEN avg_buy_price > 0 THEN 
+                ROUND(((current_price - avg_buy_price) / avg_buy_price) * 100, 2)
+            ELSE 0 
+        END
+    ) STORED
 );
 
 -- 创建 transactions 表
