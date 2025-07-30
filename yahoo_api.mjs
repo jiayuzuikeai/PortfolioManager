@@ -169,7 +169,7 @@ app.get('/api/portfolio', async (_req, res) => {
     
     // 获取所有持仓
     const [portfolioRows] = await connection.query(`
-      SELECT ticker, quantity, avg_buy_price, current_price, stock_return 
+      SELECT ticker, quantity, avg_buy_price, current_price, stock_return, stock_return_rate
       FROM portfolio 
       WHERE quantity > 0
     `);
@@ -503,8 +503,122 @@ app.post('/api/daily_snapshot', async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
+/* 13. 更新投资组合股票价格  POST /api/portfolio/update-prices         */
+/* ------------------------------------------------------------------ */
+app.post('/api/portfolio/update-prices', async (req, res) => {
+  try {
+    console.log(`[${new Date().toISOString()}] 开始更新投资组合股票价格`);
+    
+    const result = await updatePortfolioPrices();
+    
+    if (result.success) {
+      res.json({
+        message: 'Portfolio prices updated successfully',
+        updated_count: result.updatedCount,
+        total_count: result.totalCount,
+        updated_stocks: result.updatedStocks,
+        failed_stocks: result.failedStocks
+      });
+    } else {
+      res.status(500).json({ error: result.error });
+    }
+    
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
 /* 自动快照函数 - 内部使用                                            */
 /* ------------------------------------------------------------------ */
+async function updatePortfolioPrices() {
+  try {
+    console.log(`[${new Date().toISOString()}] 开始获取投资组合股票列表`);
+    
+    const connection = await pool.getConnection();
+    
+    try {
+      // 获取所有持仓股票
+      const [portfolioRows] = await connection.query(`
+        SELECT ticker FROM portfolio WHERE quantity > 0
+      `);
+      
+      const totalCount = portfolioRows.length;
+      let updatedCount = 0;
+      const updatedStocks = [];
+      const failedStocks = [];
+      
+      console.log(`[${new Date().toISOString()}] 找到 ${totalCount} 只股票需要更新价格`);
+      
+      // 循环更新每只股票的价格
+      for (const stock of portfolioRows) {
+        const ticker = stock.ticker;
+        
+        try {
+          console.log(`[${new Date().toISOString()}] 正在获取 ${ticker} 的最新价格...`);
+          
+          // 调用 Yahoo Finance API 获取股票价格
+          const quoteResult = await yahooFinance.quote(ticker);
+          const currentPrice = quoteResult.regularMarketPrice;
+          
+          if (currentPrice && currentPrice > 0) {
+            // 更新数据库中的当前价格
+            await connection.query(
+              'UPDATE portfolio SET current_price = ? WHERE ticker = ?',
+              [currentPrice, ticker]
+            );
+            
+            updatedCount++;
+            updatedStocks.push({
+              ticker,
+              price: currentPrice,
+              currency: quoteResult.currency || 'USD'
+            });
+            
+            console.log(`[${new Date().toISOString()}] ✅ ${ticker} 价格更新成功: $${currentPrice}`);
+          } else {
+            failedStocks.push({
+              ticker,
+              error: 'Invalid price data received'
+            });
+            console.log(`[${new Date().toISOString()}] ❌ ${ticker} 价格数据无效`);
+          }
+          
+          // 添加短暂延迟避免API限制
+          await new Promise(resolve => setTimeout(resolve, 100));
+          
+        } catch (error) {
+          failedStocks.push({
+            ticker,
+            error: error.message
+          });
+          console.error(`[${new Date().toISOString()}] ❌ ${ticker} 价格获取失败:`, error.message);
+        }
+      }
+      
+      connection.release();
+      
+      console.log(`[${new Date().toISOString()}] 价格更新完成: ${updatedCount}/${totalCount} 成功`);
+      
+      return {
+        success: true,
+        totalCount,
+        updatedCount,
+        updatedStocks,
+        failedStocks
+      };
+      
+    } catch (error) {
+      connection.release();
+      throw error;
+    }
+    
+  } catch (error) {
+    console.error(`[${new Date().toISOString()}] 投资组合价格更新失败:`, error.message);
+    return { success: false, error: error.message };
+  }
+}
+
 async function createDailySnapshot(targetDate = null) {
   try {
     const snapshotDate = targetDate || new Date().toISOString().split('T')[0];
@@ -617,23 +731,45 @@ async function createDailySnapshot(targetDate = null) {
 //   }
 // });
 
-// 测试任务2: 使用UTC时间，当前时间+2分钟
-const now = new Date();
-const testMinute = (now.getMinutes() + 30) % 60;
-const testHour = now.getMinutes() + 30 >= 60 ? (now.getHours() + 1) % 24 : now.getHours();
-console.log(`设置UTC测试时间: ${testHour}:${testMinute}`);
+// 测试任务: 每分钟更新投资组合股票价格 (用于测试)
+// cron.schedule('* * * * *', async () => {
+//   console.log(`[${new Date().toISOString()}] 📈 测试任务触发 - 每分钟更新股票价格`);
+//   console.log(`当前北京时间: ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`);
+//   console.log(`当前系统时间: ${new Date().toString()}`);
+//   const result = await updatePortfolioPrices();
+//   if (result.success) {
+//     console.log(`[${new Date().toISOString()}] ✅ 测试价格更新成功: ${result.updatedCount}/${result.totalCount}`);
+//   } else {
+//     console.log(`[${new Date().toISOString()}] ❌ 测试价格更新失败: ${result.error}`);
+//   }
+// });
 
-cron.schedule(`${testMinute} ${testHour} * * *`, async () => {
-  console.log(`[${new Date().toISOString()}] 🧪 UTC测试任务触发`);
+// 定时任务: 每天北京时间早上9点40分执行
+cron.schedule('40 9 * * *', async () => {
+  console.log(`[${new Date().toISOString()}] 🕘 每日定时任务触发 - 北京时间9:40`);
   console.log(`当前北京时间: ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`);
+  console.log(`当前系统时间: ${new Date().toString()}`);
+  console.log(`当前UTC时间: ${new Date().toISOString()}`);
   const result = await createDailySnapshot();
   if (result.success) {
-    console.log(`[${new Date().toISOString()}] ✅ UTC测试快照成功完成`);
+    console.log(`[${new Date().toISOString()}] ✅ 每日快照成功完成`);
   } else {
-    console.log(`[${new Date().toISOString()}] ❌ UTC测试快照失败: ${result.error}`);
+    console.log(`[${new Date().toISOString()}] ❌ 每日快照失败: ${result.error}`);
   }
 }, {
-  timezone: "UTC"
+  timezone: "Asia/Shanghai"
+});
+
+// 定时任务: 每两小时更新投资组合股票价格
+cron.schedule('0 */2 * * *', async () => {
+  console.log(`[${new Date().toISOString()}] 📈 每两小时价格更新任务触发`);
+  console.log(`当前北京时间: ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`);
+  const result = await updatePortfolioPrices();
+  if (result.success) {
+    console.log(`[${new Date().toISOString()}] ✅ 价格更新成功: ${result.updatedCount}/${result.totalCount}`);
+  } else {
+    console.log(`[${new Date().toISOString()}] ❌ 价格更新失败: ${result.error}`);
+  }
 });
 
 // 方案1: 使用夏令时时间 (适用于大部分时间)
@@ -656,8 +792,9 @@ cron.schedule(`${testMinute} ${testHour} * * *`, async () => {
 
 // 启动时输出定时任务信息
 console.log('定时任务已设置:');
-console.log('🧪 测试任务1: 每分钟执行一次 (调试用)');
-console.log('🧪 测试任务2: UTC时间测试30');
+// console.log('� 测试任务: 每分钟更新股票价格 (调试用)');
+console.log('�🕘 每日定时任务: 北京时间9:40执行 (Asia/Shanghai时区)');
+console.log('📈 价格更新任务: 每两小时执行一次 (0 */2 * * *)');
 console.log('- 美股交易日 UTC 21:00 (北京时间凌晨5点) - 已注释');
 console.log('- 美股交易日 ET 17:00 (美东时间下午5点) - 已注释');
 console.log(`当前北京时间: ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`);
