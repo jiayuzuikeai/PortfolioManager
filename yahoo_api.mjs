@@ -4,12 +4,14 @@ import yahooFinance from 'yahoo-finance2';
 import pool from './db/pool.js';
 import axios from 'axios';
 import cron from 'node-cron';
+import cors from 'cors';
 
 const app = express();
 const port = process.env.PORT || 3000;
 
 // Middleware for parsing JSON
 app.use(express.json());
+app.use(cors());
 
 /* ------------------------------------------------------------------ */
 /* 1. 股票搜索  GET /api/search?q=KEYWORD                              */
