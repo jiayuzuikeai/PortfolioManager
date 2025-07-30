@@ -1,11 +1,15 @@
 // index.mjs
 import express from 'express';
 import yahooFinance from 'yahoo-finance2';
+import pool from './db/pool.js';
+import axios from 'axios';
+import cron from 'node-cron';
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-import axios from 'axios';
+// Middleware for parsing JSON
+app.use(express.json());
 
 /* ------------------------------------------------------------------ */
 /* 1. 股票搜索  GET /api/search?q=KEYWORD                              */
@@ -155,6 +159,510 @@ app.get('/api/history/:ticker', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+/* ------------------------------------------------------------------ */
+/* 7. 当前持仓查询  GET /api/portfolio                                 */
+/* ------------------------------------------------------------------ */
+app.get('/api/portfolio', async (_req, res) => {
+  try {
+    const connection = await pool.getConnection();
+    
+    // 获取所有持仓
+    const [portfolioRows] = await connection.query(`
+      SELECT ticker, quantity, avg_buy_price, current_price, stock_return 
+      FROM portfolio 
+      WHERE quantity > 0
+    `);
+    
+    // 获取现金余额
+    const [cashRows] = await connection.query('SELECT balance FROM cash WHERE id = 1');
+    const cashBalance = cashRows[0]?.balance || 0;
+    
+    // 计算总股票价值和总收益
+    let totalStockValue = 0;
+    let totalReturn = 0;
+    
+    for (const stock of portfolioRows) {
+      totalStockValue += parseFloat(stock.current_price) * stock.quantity;
+      totalReturn += parseFloat(stock.stock_return);
+    }
+    
+    connection.release();
+    
+    res.json({
+      portfolio: portfolioRows,
+      total_stock_value: totalStockValue,
+      total_return: totalReturn
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* 8. 买入操作  POST /api/portfolio/buy                               */
+/*    Body: { ticker, quantity, price }                              */
+/* ------------------------------------------------------------------ */
+app.post('/api/portfolio/buy', async (req, res) => {
+  try {
+    const { ticker, quantity, price } = req.body;
+    
+    if (!ticker || !quantity || !price) {
+      return res.status(400).json({ 
+        error: 'Missing required fields: ticker, quantity, price' 
+      });
+    }
+    
+    if (quantity <= 0 || price <= 0) {
+      return res.status(400).json({ 
+        error: 'Quantity and price must be positive numbers' 
+      });
+    }
+    
+    const totalCost = quantity * price;
+    const connection = await pool.getConnection();
+    
+    try {
+      await connection.beginTransaction();
+      
+      // 检查现金是否足够
+      const [cashRows] = await connection.query('SELECT balance FROM cash WHERE id = 1');
+      const currentCash = parseFloat(cashRows[0]?.balance || 0);
+      
+      if (currentCash < totalCost) {
+        await connection.rollback();
+        connection.release();
+        return res.status(400).json({ 
+          error: 'Insufficient cash balance',
+          required: totalCost,
+          available: currentCash
+        });
+      }
+      
+      // 检查是否已有该股票持仓
+      const [existingRows] = await connection.query(
+        'SELECT quantity, avg_buy_price FROM portfolio WHERE ticker = ?',
+        [ticker]
+      );
+      
+      if (existingRows.length > 0) {
+        // 更新现有持仓 - 计算新的平均买入价
+        const existingQuantity = existingRows[0].quantity;
+        const existingAvgPrice = parseFloat(existingRows[0].avg_buy_price);
+        const newQuantity = existingQuantity + quantity;
+        const newAvgPrice = ((existingQuantity * existingAvgPrice) + totalCost) / newQuantity;
+        
+        await connection.query(
+          'UPDATE portfolio SET quantity = ?, avg_buy_price = ?, current_price = ? WHERE ticker = ?',
+          [newQuantity, newAvgPrice, price, ticker]
+        );
+      } else {
+        // 创建新持仓
+        await connection.query(
+          'INSERT INTO portfolio (ticker, quantity, avg_buy_price, current_price) VALUES (?, ?, ?, ?)',
+          [ticker, quantity, price, price]
+        );
+      }
+      
+      // 记录交易
+      await connection.query(
+        'INSERT INTO transactions (ticker, type, quantity, price) VALUES (?, ?, ?, ?)',
+        [ticker, 'BUY', quantity, price]
+      );
+      
+      // 更新现金余额
+      await connection.query(
+        'UPDATE cash SET balance = balance - ? WHERE id = 1',
+        [totalCost]
+      );
+      
+      await connection.commit();
+      connection.release();
+      
+      res.json({
+        message: 'Buy order executed successfully',
+        ticker,
+        quantity,
+        price,
+        total_cost: totalCost,
+        remaining_cash: currentCash - totalCost
+      });
+      
+    } catch (error) {
+      await connection.rollback();
+      connection.release();
+      throw error;
+    }
+    
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* 9. 卖出操作  POST /api/portfolio/sell                              */
+/*    Body: { ticker, quantity, price }                              */
+/* ------------------------------------------------------------------ */
+app.post('/api/portfolio/sell', async (req, res) => {
+  try {
+    const { ticker, quantity, price } = req.body;
+    
+    if (!ticker || !quantity || !price) {
+      return res.status(400).json({ 
+        error: 'Missing required fields: ticker, quantity, price' 
+      });
+    }
+    
+    if (quantity <= 0 || price <= 0) {
+      return res.status(400).json({ 
+        error: 'Quantity and price must be positive numbers' 
+      });
+    }
+    
+    const totalRevenue = quantity * price;
+    const connection = await pool.getConnection();
+    
+    try {
+      await connection.beginTransaction();
+      
+      // 检查是否有足够的股票可卖
+      const [portfolioRows] = await connection.query(
+        'SELECT quantity, avg_buy_price FROM portfolio WHERE ticker = ?',
+        [ticker]
+      );
+      
+      if (portfolioRows.length === 0) {
+        await connection.rollback();
+        connection.release();
+        return res.status(400).json({ 
+          error: 'No position found for this ticker' 
+        });
+      }
+      
+      const currentQuantity = portfolioRows[0].quantity;
+      const avgBuyPrice = parseFloat(portfolioRows[0].avg_buy_price);
+      
+      if (currentQuantity < quantity) {
+        await connection.rollback();
+        connection.release();
+        return res.status(400).json({ 
+          error: 'Insufficient shares to sell',
+          requested: quantity,
+          available: currentQuantity
+        });
+      }
+      
+      const newQuantity = currentQuantity - quantity;
+      
+      if (newQuantity === 0) {
+        // 完全卖出，删除持仓记录
+        await connection.query('DELETE FROM portfolio WHERE ticker = ?', [ticker]);
+      } else {
+        // 部分卖出，更新数量和当前价格
+        await connection.query(
+          'UPDATE portfolio SET quantity = ?, current_price = ? WHERE ticker = ?',
+          [newQuantity, price, ticker]
+        );
+      }
+      
+      // 记录交易
+      await connection.query(
+        'INSERT INTO transactions (ticker, type, quantity, price) VALUES (?, ?, ?, ?)',
+        [ticker, 'SELL', quantity, price]
+      );
+      
+      // 更新现金余额
+      await connection.query(
+        'UPDATE cash SET balance = balance + ? WHERE id = 1',
+        [totalRevenue]
+      );
+      
+      // 计算这次交易的盈亏
+      const profit = (price - avgBuyPrice) * quantity;
+      
+      await connection.commit();
+      connection.release();
+      
+      res.json({
+        message: 'Sell order executed successfully',
+        ticker,
+        quantity,
+        price,
+        total_revenue: totalRevenue,
+        profit_loss: profit,
+        remaining_shares: newQuantity
+      });
+      
+    } catch (error) {
+      await connection.rollback();
+      connection.release();
+      throw error;
+    }
+    
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* 10. 查看现金余额  GET /api/cash                                    */
+/* ------------------------------------------------------------------ */
+app.get('/api/cash', async (_req, res) => {
+  try {
+    const connection = await pool.getConnection();
+    
+    const [cashRows] = await connection.query('SELECT balance FROM cash WHERE id = 1');
+    const cashBalance = parseFloat(cashRows[0]?.balance || 0);
+    
+    connection.release();
+    
+    res.json({
+      cash_balance: cashBalance,
+      currency: 'USD'
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* 11. 获取每日资产快照  GET /api/daily_snapshot                      */
+/* ------------------------------------------------------------------ */
+app.get('/api/daily_snapshot', async (req, res) => {
+  try {
+    const { limit = 30, start_date, end_date } = req.query;
+    const connection = await pool.getConnection();
+    
+    let query = `
+      SELECT 
+        snapshot_date,
+        total_stock_value,
+        cash_balance,
+        total_value,
+        total_return,
+        total_return_rate
+      FROM daily_snapshot
+    `;
+    
+    const params = [];
+    const conditions = [];
+    
+    // 添加日期过滤条件
+    if (start_date) {
+      conditions.push('snapshot_date >= ?');
+      params.push(start_date);
+    }
+    
+    if (end_date) {
+      conditions.push('snapshot_date <= ?');
+      params.push(end_date);
+    }
+    
+    if (conditions.length > 0) {
+      query += ` WHERE ${conditions.join(' AND ')}`;
+    }
+    
+    query += ` ORDER BY snapshot_date DESC LIMIT ?`;
+    params.push(parseInt(limit));
+    
+    const [rows] = await connection.query(query, params);
+    connection.release();
+    
+    res.json({
+      snapshots: rows,
+      count: rows.length
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* 12. 触发资产快照更新  POST /api/daily_snapshot                     */
+/* ------------------------------------------------------------------ */
+app.post('/api/daily_snapshot', async (req, res) => {
+  try {
+    const { snapshot_date } = req.body;
+    const targetDate = snapshot_date || new Date().toISOString().split('T')[0];
+    
+    const result = await createDailySnapshot(targetDate);
+    
+    if (result.success) {
+      res.json({
+        message: 'Daily snapshot created/updated successfully',
+        snapshot_date: result.snapshot_date,
+        data: result.data
+      });
+    } else {
+      res.status(500).json({ error: result.error });
+    }
+    
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* 自动快照函数 - 内部使用                                            */
+/* ------------------------------------------------------------------ */
+async function createDailySnapshot(targetDate = null) {
+  try {
+    const snapshotDate = targetDate || new Date().toISOString().split('T')[0];
+    console.log(`[${new Date().toISOString()}] 开始创建每日资产快照: ${snapshotDate}`);
+    
+    const connection = await pool.getConnection();
+    
+    try {
+      await connection.beginTransaction();
+      
+      // 1. 计算当前现金余额
+      const [cashRows] = await connection.query('SELECT balance FROM cash WHERE id = 1');
+      const cashBalance = parseFloat(cashRows[0]?.balance || 0);
+      
+      // 2. 计算当前股票总价值和总收益
+      const [portfolioRows] = await connection.query(`
+        SELECT 
+          SUM(current_price * quantity) as total_stock_value,
+          SUM(stock_return) as total_return
+        FROM portfolio 
+        WHERE quantity > 0
+      `);
+      
+      const totalStockValue = parseFloat(portfolioRows[0]?.total_stock_value || 0);
+      const totalReturn = parseFloat(portfolioRows[0]?.total_return || 0);
+      const totalValue = cashBalance + totalStockValue;
+      
+      // 3. 计算总收益率 (假设初始资金为500000)
+      const initialInvestment = 500000;
+      const totalReturnRate = ((totalValue - initialInvestment) / initialInvestment) * 100;
+      
+      // 4. 检查是否已存在该日期的快照
+      const [existingRows] = await connection.query(
+        'SELECT id FROM daily_snapshot WHERE snapshot_date = ?',
+        [snapshotDate]
+      );
+      
+      if (existingRows.length > 0) {
+        // 更新现有快照
+        await connection.query(`
+          UPDATE daily_snapshot 
+          SET 
+            total_stock_value = ?,
+            cash_balance = ?,
+            total_value = ?,
+            total_return = ?,
+            total_return_rate = ?
+          WHERE snapshot_date = ?
+        `, [totalStockValue, cashBalance, totalValue, totalReturn, totalReturnRate, snapshotDate]);
+        console.log(`[${new Date().toISOString()}] 快照更新成功: ${snapshotDate}`);
+      } else {
+        // 创建新快照
+        await connection.query(`
+          INSERT INTO daily_snapshot 
+          (snapshot_date, total_stock_value, cash_balance, total_value, total_return, total_return_rate)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `, [snapshotDate, totalStockValue, cashBalance, totalValue, totalReturn, totalReturnRate]);
+        console.log(`[${new Date().toISOString()}] 快照创建成功: ${snapshotDate}`);
+      }
+      
+      await connection.commit();
+      connection.release();
+      
+      return {
+        success: true,
+        snapshot_date: snapshotDate,
+        data: {
+          total_stock_value: totalStockValue,
+          cash_balance: cashBalance,
+          total_value: totalValue,
+          total_return: totalReturn,
+          total_return_rate: parseFloat(totalReturnRate.toFixed(2))
+        }
+      };
+      
+    } catch (error) {
+      await connection.rollback();
+      connection.release();
+      throw error;
+    }
+    
+  } catch (error) {
+    console.error(`[${new Date().toISOString()}] 快照创建失败:`, error.message);
+    return { success: false, error: error.message };
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* 定时任务设置                                                       */
+/* ------------------------------------------------------------------ */
+
+// 美股市场时间 (ET): 9:30 AM - 4:00 PM
+// 转换为UTC时间: 
+// - 夏令时 (3月第二个周日 - 11月第一个周日): 13:30 - 20:00 UTC
+// - 冬令时: 14:30 - 21:00 UTC
+// 我们设置在收盘后1小时执行快照，即:
+// - 夏令时: 21:00 UTC (北京时间凌晨5点)
+// - 冬令时: 22:00 UTC (北京时间早上6点)
+
+// 测试任务: 每分钟执行一次 (用于测试)
+// cron.schedule('* * * * *', async () => {
+//   console.log(`[${new Date().toISOString()}] 🧪 测试任务触发 - 每分钟测试`);
+//   console.log(`当前北京时间: ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`);
+//   console.log(`当前系统时间: ${new Date().toString()}`);
+//   const result = await createDailySnapshot();
+//   if (result.success) {
+//     console.log(`[${new Date().toISOString()}] ✅ 测试快照成功完成`);
+//   } else {
+//     console.log(`[${new Date().toISOString()}] ❌ 测试快照失败: ${result.error}`);
+//   }
+// });
+
+// 测试任务2: 使用UTC时间，当前时间+2分钟
+const now = new Date();
+const testMinute = (now.getMinutes() + 30) % 60;
+const testHour = now.getMinutes() + 30 >= 60 ? (now.getHours() + 1) % 24 : now.getHours();
+console.log(`设置UTC测试时间: ${testHour}:${testMinute}`);
+
+cron.schedule(`${testMinute} ${testHour} * * *`, async () => {
+  console.log(`[${new Date().toISOString()}] 🧪 UTC测试任务触发`);
+  console.log(`当前北京时间: ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`);
+  const result = await createDailySnapshot();
+  if (result.success) {
+    console.log(`[${new Date().toISOString()}] ✅ UTC测试快照成功完成`);
+  } else {
+    console.log(`[${new Date().toISOString()}] ❌ UTC测试快照失败: ${result.error}`);
+  }
+}, {
+  timezone: "UTC"
+});
+
+// 方案1: 使用夏令时时间 (适用于大部分时间)
+// 每天UTC时间21:00执行 (北京时间凌晨5点)
+// cron.schedule('0 21 * * 1-5', async () => {
+//   console.log(`[${new Date().toISOString()}] 定时任务触发 - 美股交易日快照`);
+//   await createDailySnapshot();
+// }, {
+//   timezone: "UTC"
+// });
+
+// 方案2: 也可以使用美国东部时间
+// 每天东部时间17:00执行 (收盘后1小时)
+// cron.schedule('0 17 * * 1-5', async () => {
+//   console.log(`[${new Date().toISOString()}] 定时任务触发 - 美股收盘后快照`);
+//   await createDailySnapshot();
+// }, {
+//   timezone: "America/New_York"
+// });
+
+// 启动时输出定时任务信息
+console.log('定时任务已设置:');
+console.log('🧪 测试任务1: 每分钟执行一次 (调试用)');
+console.log('🧪 测试任务2: UTC时间测试30');
+console.log('- 美股交易日 UTC 21:00 (北京时间凌晨5点) - 已注释');
+console.log('- 美股交易日 ET 17:00 (美东时间下午5点) - 已注释');
+console.log(`当前北京时间: ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`);
+console.log(`当前UTC时间: ${new Date().toISOString()}`);
+console.log(`当前系统时间: ${new Date().toString()}`);
 
 /* ------------------------------------------------------------------ */
 app.listen(port, () => console.log(`Server listening on http://localhost:${port}`));
