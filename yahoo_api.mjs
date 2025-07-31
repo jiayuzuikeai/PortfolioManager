@@ -4,14 +4,134 @@ import yahooFinance from 'yahoo-finance2';
 import pool from './db/pool.js';
 import axios from 'axios';
 import cron from 'node-cron';
+import OpenAI from 'openai';
 import cors from 'cors';
+import http from 'http';
+import dotenv from 'dotenv';
+dotenv.config();      
 
 const app = express();
 const port = process.env.PORT || 3000;
 
 // Middleware for parsing JSON
 app.use(express.json());
-app.use(cors());
+app.use(cors()); 
+
+const kimi = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+  baseURL: process.env.OPENAI_BASE_URL
+});
+
+/* ---------- 会话缓存（生产环境用 Redis） ---------- */
+const sessions = new Map(); // <sessionId, Array<Message>>
+
+
+/* ---------- 投资管理助手：多轮聊天（SSE 流式） ---------- */
+app.get('/api/chat', async (req, res) => {
+  try {
+    const { q: userInput, sessionId = 'default' } = req.query;
+    if (!userInput) {
+      return res.status(400).json({ error: 'Missing query param "q"' });
+    }
+
+    /* ---------- 1. 实时拉取持仓信息 ---------- */
+    let portfolioText = '';
+    try {
+      // 本地调用自己的接口，不走网络
+      const portfolioRes = await new Promise((resolve, reject) => {
+        const httpReq = http.request(
+          {
+            hostname: 'localhost',
+            port,
+            path: '/api/portfolio',
+            method: 'GET',
+          },
+          (httpRes) => {
+            let body = '';
+            httpRes.on('data', (chunk) => (body += chunk));
+            httpRes.on('end', () => resolve(JSON.parse(body)));
+          }
+        );
+        httpReq.on('error', reject);
+        httpReq.end();
+      });
+
+      const { portfolio, total_stock_value, total_return, cashBalance } = portfolioRes;
+      const cash = portfolioRes.cashBalance ?? 0;
+
+      // 拼成自然语言
+      portfolioText = `
+      Portfolio Overview (as of ${new Date().toLocaleString()}):
+      - Cash Balance: ${cash.toFixed(2)} CNY
+      - Total Stock Value: ${total_stock_value.toFixed(2)} CNY
+      - Cumulative P/L: ${total_return.toFixed(2)} CNY
+      Holdings:
+      ${portfolio
+        .map(
+          (p) =>
+            `  ${p.ticker}: ${p.quantity} shares, avg cost ${parseFloat(
+              p.avg_buy_price
+            ).toFixed(2)} CNY, current price ${parseFloat(p.current_price).toFixed(
+              2
+            )} CNY, P/L ${parseFloat(p.stock_return).toFixed(2)} CNY (${(
+              parseFloat(p.stock_return_rate) * 100
+            ).toFixed(2)}%)`
+        )
+        .join('\n')}
+      `;
+      console.log('AI has fetched portfolio info!');
+      } catch (e) {
+        console.error('Failed to load portfolio', e);
+        portfolioText = '(Unable to fetch latest holdings at the moment)';
+      }
+
+      /* ---------- 2. Initialize / Retrieve Session ---------- */
+      if (!sessions.has(sessionId)) {
+        sessions.set(sessionId, [
+          {
+            role: 'system',
+            content:
+              'You are my line manager. Provide accurate, compliant investment analysis and advice based on the latest real holdings below; decline any illegal or non-compliant content.\n\n',
+          },
+        ]);
+      }
+
+      const history = sessions.get(sessionId);
+      history.push({ role: 'system', content: 'Latest holdings: ' + portfolioText });
+      history.push({ role: 'user', content: userInput });
+
+    /* ---------- SSE 头 ---------- */
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    /* ---------- 3. 请求 Kimi 流式回答 ---------- */
+    const stream = await kimi.chat.completions.create({
+      model: 'kimi-k2-0711-preview',
+      messages: history,
+      stream: true,
+    });
+
+    let assistantText = '';
+    for await (const chunk of stream) {
+      const delta = chunk.choices[0]?.delta?.content || '';
+      assistantText += delta;
+      res.write(`data: ${JSON.stringify({ delta })}\n\n`);
+    }
+
+    history.push({ role: 'assistant', content: assistantText });
+    sessions.set(sessionId, history);
+
+    res.write('data: [DONE]\n\n');
+    res.end();
+  } catch (err) {
+    console.error(err);
+    res.write(`data: ${JSON.stringify({ error: 'Chat failed' })}\n\n`);
+    res.end();
+  }
+});
+
 
 /* ------------------------------------------------------------------ */
 /* 1. 股票搜索  GET /api/search?q=KEYWORD                              */
