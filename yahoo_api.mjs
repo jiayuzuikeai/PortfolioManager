@@ -716,7 +716,37 @@ app.post('/api/daily_snapshot', async (req, res) => {
 });
 
 /* ------------------------------------------------------------------ */
-/* 13. 更新投资组合股票价格  POST /api/portfolio/update-prices         */
+/* 13. 获取最近10笔交易记录  GET /api/transactions/recent              */
+/* ------------------------------------------------------------------ */
+app.get('/api/transactions/recent', async (req, res) => {
+  try {
+    console.log(`[${new Date().toISOString()}] 获取最近10笔交易记录`);
+    
+    const query = `
+      SELECT ticker, type, quantity, price, timestamp 
+      FROM transactions 
+      ORDER BY timestamp DESC 
+      LIMIT 10
+    `;
+    
+    const [rows] = await pool.execute(query);
+    
+    res.json({
+      success: true,
+      transactions: rows
+    });
+    
+  } catch (error) {
+    console.error('Error fetching recent transactions:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Failed to fetch recent transactions' 
+    });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* 14. 更新投资组合股票价格  POST /api/portfolio/update-prices         */
 /* ------------------------------------------------------------------ */
 app.post('/api/portfolio/update-prices', async (req, res) => {
   try {
@@ -973,9 +1003,9 @@ cron.schedule('40 9 * * *', async () => {
   timezone: "Asia/Shanghai"
 });
 
-// 定时任务: 每两小时更新投资组合股票价格
-cron.schedule('0 */2 * * *', async () => {
-  console.log(`[${new Date().toISOString()}] 📈 每两小时价格更新任务触发`);
+// 定时任务: 每小时更新投资组合股票价格
+cron.schedule('0 * * * *', async () => {
+  console.log(`[${new Date().toISOString()}] 📈 每小时价格更新任务触发`);
   console.log(`当前北京时间: ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`);
   const result = await updatePortfolioPrices();
   if (result.success) {
@@ -1007,7 +1037,7 @@ cron.schedule('0 */2 * * *', async () => {
 console.log('定时任务已设置:');
 // console.log('� 测试任务: 每分钟更新股票价格 (调试用)');
 console.log('�🕘 每日定时任务: 北京时间9:40执行 (Asia/Shanghai时区)');
-console.log('📈 价格更新任务: 每两小时执行一次 (0 */2 * * *)');
+console.log('📈 价格更新任务: 每小时执行一次 (0 * * * *)');
 console.log('- 美股交易日 UTC 21:00 (北京时间凌晨5点) - 已注释');
 console.log('- 美股交易日 ET 17:00 (美东时间下午5点) - 已注释');
 console.log(`当前北京时间: ${new Date().toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai'})}`);
