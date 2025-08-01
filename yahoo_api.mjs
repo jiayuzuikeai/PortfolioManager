@@ -1016,3 +1016,4 @@ console.log(`当前系统时间: ${new Date().toString()}`);
 
 /* ------------------------------------------------------------------ */
 app.listen(port, () => console.log(`Server listening on http://localhost:${port}`));
+export default app;
